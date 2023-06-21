@@ -19,8 +19,10 @@ blip/src/instrNoise.py
 blip/src/makeLISAdata.py
 blip/src/models.py
 blip/src/nessai_engine.py
+blip/src/numpyro_engine.py
 blip/src/orbitinglisa.py
 blip/src/sph_geometry.py
+blip/src/utils.py
 blip/tools/SetRandomState.py
 blip/tools/__init__.py
 blip/tools/hierarchical_postprocess.py

@@ -38,20 +38,35 @@ def mapmaker(post, params, parameters, Model, saveto=None, coord=None, cmap=None
     
     
     
-    sph_models = []
-    hierarchical_models = []
+    
+#    sph_models = []
+#    hierarchical_models = []
+#    fixedsky_models = []
+#    
+#    for submodel_name in Model.submodel_names:
+#        
+#        ## spatial type will be the latter part of the name
+#        ## also catch duplicates (with -N appended to them_)
+#        spatial_name = submodel_name.split('_')[-1].split('-')[0]
+#        if spatial_name == 'sph':
+#            sph_models.append(submodel_name)
+#        elif spatial_name == 'hierarchical':
+#            hierarchical_models.append(submodel_name)
+#        elif spatial_name in ['fixedgalaxy','hotpixel']:
+#            fixedsky_models.append(submodel_name)
+#    if (len(sph_models)==0 ) and (len(hierarchical_models)==0) and (len(fixedsky_models)==0):
+#        print("Called mapmaker but none of the recovery models have a non-isotropic spatial model. Skipping...")
+#        return
+    
+    map_models = []
     for submodel_name in Model.submodel_names:
-        ## spatial type will be the latter part of the name
-        ## also catch duplicates (with -N appended to them_)
-        spatial_name = submodel_name.split('_')[-1].split('-')[0]
-        if spatial_name == 'sph':
-            sph_models.append(submodel_name)
-        elif spatial_name == 'hierarchical':
-            hierarchical_models.append(submodel_name)
-    if (len(sph_models)==0 ) and (len(hierarchical_models)==0):
+        sm = Model.submodels[submodel_name]
+        if sm.has_map:
+            map_models.append(submodel_name)
+
+    if (len(map_models)==0 ):
         print("Called mapmaker but none of the recovery models have a non-isotropic spatial model. Skipping...")
         return
-    
     
     ## handle projection, kwargs
     # setting coord back to E, if parameter isn't specified
@@ -82,7 +97,16 @@ def mapmaker(post, params, parameters, Model, saveto=None, coord=None, cmap=None
         omega_map = np.zeros(npix)
         
         ## only make a map if there's a map to make (this is also good life advice)
-        if submodel_name in sph_models+hierarchical_models:
+        if submodel_name in map_models:
+            
+            ## no hierarchical support yet
+            if hasattr(sm,"hierarchical") and sm.hierarchical:
+                print("Hierarchical mapmaking not yet supported, sorry!")
+                pass
+            
+            ## kwargs
+            post_map_kwargs_i = post_map_kwargs
+            
             
             ## HEALpy is really, REALLY noisy sometimes. This stops that.
             logger = logging.getLogger()
@@ -91,28 +115,39 @@ def mapmaker(post, params, parameters, Model, saveto=None, coord=None, cmap=None
             ## select relevant posterior columns
             post_i = post[:,start_idx:(start_idx+sm.Npar)]
             
-            print("Computing marginalized posterior skymap for submodel: {}...".format(submodel_name))
+
+            if hasattr(sm,"fixed_map") and sm.fixed_map:
+                print("Generating assumed skymap at spectral posterior mean for submodel: {}...".format(submodel_name))
+                skip_median = True
+                post_map_kwargs_i['title'] = 'Assumed sky distribution evaluated at spectral posterior mean of $\\Omega(f= 1mHz) $'
+                norm_map = sm.sph_skymap
+                for ii in range(post.shape[0]):
+                    ## get Omega(f=1mHz)
+                    Omega_1mHz = sm.omegaf(1e-3,*post_i[ii,:])
+                    omega_map = omega_map + Omega_1mHz * norm_map
+            else:
+                print("Computing marginalized posterior skymap for submodel: {}...".format(submodel_name))
             
-            for ii in range(post.shape[0]):
-                
-                ## get Omega(f=1mHz)
-                Omega_1mHz = sm.omegaf(1e-3,*post_i[ii,:sm.blm_start])
-                
-                ## convert blm params to full blms
-                blm_vals = sm.blm_params_2_blms(post_i[ii,sm.blm_start:])
-                
-                ## normalize, convert to map, and sum
-                norm = np.sum(blm_vals[0:(sm.lmax + 1)]**2) + np.sum(2*np.abs(blm_vals[(sm.lmax + 1):])**2)
-                
-                prob_map  = (1.0/norm) * (hp.alm2map(blm_vals, nside))**2
-                
-                omega_map = omega_map + Omega_1mHz * prob_map
+                for ii in range(post.shape[0]):
+                    
+                    ## get Omega(f=1mHz)
+                    Omega_1mHz = sm.omegaf(1e-3,*post_i[ii,:sm.blm_start])
+                    
+                    ## convert blm params to full blms
+                    blm_vals = sm.blm_params_2_blms(post_i[ii,sm.blm_start:])
+                    
+                    ## normalize, convert to map, and sum
+                    norm = np.sum(blm_vals[0:(sm.lmax + 1)]**2) + np.sum(2*np.abs(blm_vals[(sm.lmax + 1):])**2)
+                    
+                    prob_map  = (1.0/norm) * (hp.alm2map(blm_vals, nside))**2
+                    
+                    omega_map = omega_map + Omega_1mHz * prob_map
 
             omega_map = omega_map/post.shape[0]
             
             
             # generating skymap
-            hp.mollview(omega_map, coord=coord, cmap=cmap, **post_map_kwargs)
+            hp.mollview(omega_map, coord=coord, cmap=cmap, **post_map_kwargs_i)
             hp.graticule()
             
             ## switch logging level back to normal so we get our own status updates
@@ -127,43 +162,46 @@ def mapmaker(post, params, parameters, Model, saveto=None, coord=None, cmap=None
                 logger.info('Saving posterior skymap at ' +  params['out_dir'] + '/{}_post_skymap.png'.format(submodel_name))
             plt.close()
             
-            ## now do the median skymap
-            print("Computing median posterior skymap for submodel {}...".format(submodel_name))
             
-            ## HEALpy is really, REALLY noisy sometimes. This stops that.
-            logger.setLevel(logging.ERROR)
             
-            # median values of the posteriors
-            med_vals = np.median(post_i, axis=0)
-            
-            # Omega(f=1mHz)
-            Omega_1mHz_median = sm.omegaf(1e-3,*med_vals[:sm.blm_start])
-            ## blms.
-            blms_median = np.append([1], med_vals[sm.blm_start:])
-            
-            blm_median_vals = sm.blm_params_2_blms(blms_median)
-        
-            norm = np.sum(blm_median_vals[0:(sm.lmax + 1)]**2) + np.sum(2*np.abs(blm_median_vals[(sm.lmax + 1):])**2)
 
-            Omega_median_map  =  Omega_1mHz_median * (1.0/norm) * (hp.alm2map(blm_median_vals, nside))**2
+            ## now do the median skymap
+            if not skip_median:
+                print("Computing median posterior skymap for submodel {}...".format(submodel_name))
+                
+                ## HEALpy is really, REALLY noisy sometimes. This stops that.
+                logger.setLevel(logging.ERROR)
+                
+                # median values of the posteriors
+                med_vals = np.median(post_i, axis=0)
+                
+                # Omega(f=1mHz)
+                Omega_1mHz_median = sm.omegaf(1e-3,*med_vals[:sm.blm_start])
+                ## blms.
+                blms_median = np.append([1], med_vals[sm.blm_start:])
+                
+                blm_median_vals = sm.blm_params_2_blms(blms_median)
             
-            hp.mollview(Omega_median_map, coord=coord, cmap=cmap, **med_map_kwargs)
+                norm = np.sum(blm_median_vals[0:(sm.lmax + 1)]**2) + np.sum(2*np.abs(blm_median_vals[(sm.lmax + 1):])**2)
+    
+                Omega_median_map  =  Omega_1mHz_median * (1.0/norm) * (hp.alm2map(blm_median_vals, nside))**2
+                
+                hp.mollview(Omega_median_map, coord=coord, cmap=cmap, **med_map_kwargs)
+                
+                hp.graticule()
+                
+                ## switch logging level back to normal so we get our own status updates
+                logger.setLevel(logging.INFO)
+                
+                if saveto is not None:
+                    plt.savefig(saveto + '/post_median_skymap.png', dpi=150)
+                    logger.info('Saving injected skymap at ' +  saveto + '/post_median_skymap.png')
             
-            hp.graticule()
+                else:
+                    plt.savefig(params['out_dir'] + '/post_median_skymap.png', dpi=150)
+                    logger.info('Saving injected skymap at ' +  params['out_dir'] + '/post_median_skymap.png')
             
-            ## switch logging level back to normal so we get our own status updates
-            logger.setLevel(logging.INFO)
-            
-            if saveto is not None:
-                plt.savefig(saveto + '/post_median_skymap.png', dpi=150)
-                logger.info('Saving injected skymap at ' +  saveto + '/post_median_skymap.png')
-        
-            else:
-                plt.savefig(params['out_dir'] + '/post_median_skymap.png', dpi=150)
-                logger.info('Saving injected skymap at ' +  params['out_dir'] + '/post_median_skymap.png')
-        
-            plt.close()
-        
+                plt.close()
             
         
         ## increment start regardless of if we made a map
@@ -255,7 +293,8 @@ def fitmaker(post,params,parameters,inj,Model,Injection=None,saveto=None,plot_co
     
     ## get frequencies
     frange = Model.fs
-    ffilt = (frange>params['fmin'])*(frange<params['fmax'])
+    ffilt = np.logical_and(frange >= params['fmin'], frange <= params['fmax'])
+#    ffilt = (frange>params['fmin'])*(frange<params['fmax'])
     ## commenting for testing version
 #    fs = frange[ffilt][::10]
     fs = frange[ffilt]
@@ -275,69 +314,71 @@ def fitmaker(post,params,parameters,inj,Model,Injection=None,saveto=None,plot_co
     ymins = []
     ## loop over submodels
     signal_model_names = [sm_name for sm_name in Model.submodel_names if sm_name!='noise']
-    for i, sm_name in enumerate(signal_model_names):
-        sm = Model.submodels[sm_name]
-        model_legend_elements.append(Line2D([0],[0],color=sm.color,lw=3,label=sm.fancyname))
-        ## this grabs the relevant bits of the posterior vector for each model
-        ## will need to fix this for the anisotropic case later...
-        post_sm = [post[:,idx] for idx in range(start_idx,start_idx+sm.Npar)]
-        ## handle any additional spatial variables (will need to fix this when I introduce hierarchical models)
-        if hasattr(sm,"blm_start"):
-            post_sm = post_sm[:sm.blm_start]
-        start_idx += sm.Npar
-        ## the spectrum of every sample
-        Sgw = sm.compute_Sgw(fs,post_sm)
-        ## get summary statistics
-        ## median and 95% C.I.
-        Sgw_median = np.median(Sgw,axis=1)
-        Sgw_upper95 = np.quantile(Sgw,0.975,axis=1)
-        Sgw_lower95 = np.quantile(Sgw,0.025,axis=1)
-        ymins.append(Sgw_median.min())
-        ymins.append(Sgw_lower95.min())
-        ## plot
-        plt.loglog(fs,Sgw_median,color=sm.color)
-        plt.fill_between(fs.flatten(),Sgw_lower95,Sgw_upper95,alpha=0.25,color=sm.color)
-        
-    if not params['load_data']:
-        ## plot the injected spectra, if known
-        for component_name in Injection.component_names:
-            if component_name != 'noise':
-                ## this will overwrite the default linestyle if 'ls' is given in cm.plot_kwargs
-                kwargs = {'ls':'--','color':Injection.components[component_name].color,
-                          **Injection.components[component_name].plot_kwargs}
-                ## overwrite color if specified in the the high-level kwargs
-                if component_name in astro_kwargs['color_dict'].keys():
-                    kwargs['color'] = astro_kwargs['color_dict'][component_name]
-                Injection.plot_injected_spectra(component_name,legend=False,ymins=ymins,**kwargs)
-                if component_name not in Model.submodel_names:
-                    model_legend_elements.append(Line2D([0],[0],color=Injection.components[component_name].color,lw=3,label=Injection.components[component_name].fancyname))
-    
-    ## avoid plot squishing due to signal spectra with cutoffs, etc.
-    if astro_kwargs['ymin'] is None:
-        ymin = np.min(ymins)
-        if ymin < 1e-43:
-            plt.ylim(bottom=1e-43)
-    else:
-        plt.ylim(bottom=astro_kwargs['ymin'])
-    plt.ylim(top=astro_kwargs['ymax'])
-    
-    ax = plt.gca()
-    model_legend = ax.legend(handles=model_legend_elements,loc='upper right')
-    ax.add_artist(model_legend)
-    N_models = len(model_legend_elements)
-    notation_legend = ax.legend(handles=notation_legend_elements,labels=notation_legend_labels,handler_map=notation_handler_map,
-                                handlelength=notation_handlelength,loc='upper right',bbox_to_anchor=(1,0.9825-0.056*N_models))
-    ax.add_artist(notation_legend)
-    
-    plt.title(astro_kwargs['title'],fontsize=astro_kwargs['title_fontsize'])
-    plt.xlabel(astro_kwargs['xlabel'],fontsize=astro_kwargs['xlabel_fontsize'])
-    plt.ylabel(astro_kwargs['ylabel'],fontsize=astro_kwargs['ylabel_fontsize'])
-    if saveto is not None:
-        plt.savefig(saveto + '/spectral_fit_astro.png', dpi=astro_kwargs['dpi'])
-    else:
-        plt.savefig(params['out_dir'] + '/spectral_fit_astro.png', dpi=astro_kwargs['dpi'])
-    print("Astrophysical spectral fit plot saved to " + params['out_dir'] + "spectral_fit_astro.png")
-    plt.close()
+    if len(signal_model_names) > 0:
+        signal_aliases = [Model.submodels[sm_name].alias for sm_name in signal_model_names if hasattr(Model.submodels[sm_name],"alias")]
+        for i, sm_name in enumerate(signal_model_names):
+            sm = Model.submodels[sm_name]
+            model_legend_elements.append(Line2D([0],[0],color=sm.color,lw=3,label=sm.fancyname))
+            ## this grabs the relevant bits of the posterior vector for each model
+            ## will need to fix this for the anisotropic case later...
+            post_sm = [post[:,idx] for idx in range(start_idx,start_idx+sm.Npar)]
+            ## handle any additional spatial variables (will need to fix this when I introduce hierarchical models)
+            if hasattr(sm,"blm_start"):
+                post_sm = post_sm[:sm.blm_start]
+            start_idx += sm.Npar
+            ## the spectrum of every sample
+            Sgw = sm.compute_Sgw(fs,post_sm)
+            ## get summary statistics
+            ## median and 95% C.I.
+            Sgw_median = np.median(Sgw,axis=1)
+            Sgw_upper95 = np.quantile(Sgw,0.975,axis=1)
+            Sgw_lower95 = np.quantile(Sgw,0.025,axis=1)
+            ymins.append(Sgw_median.min())
+            ymins.append(Sgw_lower95.min())
+            ## plot
+            plt.loglog(fs,Sgw_median,color=sm.color)
+            plt.fill_between(fs.flatten(),Sgw_lower95,Sgw_upper95,alpha=0.25,color=sm.color)
+
+        if not params['load_data']:
+            ## plot the injected spectra, if known
+            for component_name in Injection.component_names:
+                if component_name != 'noise':
+                    ## this will overwrite the default linestyle if 'ls' is given in cm.plot_kwargs
+                    kwargs = {'ls':'--','color':Injection.components[component_name].color,
+                              **Injection.components[component_name].plot_kwargs}
+                    ## overwrite color if specified in the the high-level kwargs
+                    if component_name in astro_kwargs['color_dict'].keys():
+                        kwargs['color'] = astro_kwargs['color_dict'][component_name]
+                    Injection.plot_injected_spectra(component_name,fs_new=fs,legend=False,ymins=ymins,**kwargs)
+                    if component_name not in Model.submodel_names and component_name not in signal_aliases:
+                        model_legend_elements.append(Line2D([0],[0],color=Injection.components[component_name].color,lw=3,label=Injection.components[component_name].fancyname))
+
+        ## avoid plot squishing due to signal spectra with cutoffs, etc.
+        if astro_kwargs['ymin'] is None:
+            ymin = np.min(ymins)
+            if ymin < 1e-43:
+                plt.ylim(bottom=1e-43)
+        else:
+            plt.ylim(bottom=astro_kwargs['ymin'])
+        plt.ylim(top=astro_kwargs['ymax'])
+
+        ax = plt.gca()
+        model_legend = ax.legend(handles=model_legend_elements,loc='upper right')
+        ax.add_artist(model_legend)
+        N_models = len(model_legend_elements)
+        notation_legend = ax.legend(handles=notation_legend_elements,labels=notation_legend_labels,handler_map=notation_handler_map,
+                                    handlelength=notation_handlelength,loc='upper right',bbox_to_anchor=(1,0.9825-0.056*N_models))
+        ax.add_artist(notation_legend)
+
+        plt.title(astro_kwargs['title'],fontsize=astro_kwargs['title_fontsize'])
+        plt.xlabel(astro_kwargs['xlabel'],fontsize=astro_kwargs['xlabel_fontsize'])
+        plt.ylabel(astro_kwargs['ylabel'],fontsize=astro_kwargs['ylabel_fontsize'])
+        if saveto is not None:
+            plt.savefig(saveto + '/spectral_fit_astro.png', dpi=astro_kwargs['dpi'])
+        else:
+            plt.savefig(params['out_dir'] + '/spectral_fit_astro.png', dpi=astro_kwargs['dpi'])
+        print("Astrophysical spectral fit plot saved to " + params['out_dir'] + "spectral_fit_astro.png")
+        plt.close()
     
     ## plot our recovered convolved spectra if desired
     if plot_convolved:
@@ -353,7 +394,8 @@ def fitmaker(post,params,parameters,inj,Model,Injection=None,saveto=None,plot_co
             model_legend_elements.append(Line2D([0],[0],color=sm.color,lw=3,label=sm.fancyname))
             
             fdata = sm.fs
-            filt = (fdata>params['fmin'])*(fdata<params['fmax'])
+#            filt = (fdata>params['fmin'])*(fdata<params['fmax'])
+            filt = np.logical_and(frange >= params['fmin'], frange <= params['fmax'])
             fdata = fdata[filt]
             f0 = sm.f0[filt]
 
@@ -403,15 +445,16 @@ def fitmaker(post,params,parameters,inj,Model,Injection=None,saveto=None,plot_co
                 if component_name == 'noise':
                     Injection.plot_injected_spectra(component_name,channels='22',ymins=ymins,**kwargs)
                 else:
-                    Injection.plot_injected_spectra(component_name,convolved=True,ymins=ymins,**kwargs)
-                    if component_name not in Model.submodel_names:
+                    Injection.plot_injected_spectra(component_name,fs_new=fdata,convolved=True,ymins=ymins,**kwargs)
+                    if component_name not in Model.submodel_names and component_name not in signal_aliases:
                         model_legend_elements.append(Line2D([0],[0],color=Injection.components[component_name].color,lw=3,label=Injection.components[component_name].fancyname))
         
         ## avoid plot squishing due to signal spectra with cutoffs, etc.
         if det_kwargs['ymin'] is None:
-            ymin = np.min(ymins)
-            if ymin < 1e-43:
-                plt.ylim(bottom=1e-43)
+            if len(ymins) > 0:
+                ymin = np.min(ymins)
+                if ymin < 1e-43:
+                    plt.ylim(bottom=1e-43)
         else:
             plt.ylim(bottom=det_kwargs['ymin'])
         plt.ylim(top=det_kwargs['ymax'])
@@ -469,15 +512,19 @@ def plotmaker(post, params,parameters, inj, Model, Injection=None,saveto=None):
         
         inj_truevals = Injection.truevals
         
-        truevals = {param:inj_truevals[param] for param in all_parameters if param in inj_truevals.keys()}
-        
+        truevals = {}
+        for smn in Model.submodel_names:
+            for cmn in Injection.component_names:
+                if smn == cmn or (hasattr(Model.submodels[smn],"alias") and Model.submodels[smn].alias == cmn):
+                    truevals |= {param:inj_truevals[cmn][param] for param in Model.submodels[smn].parameters if param in inj_truevals[cmn].keys()}
+                    
         if len(truevals) > 0:
             knowTrue = 1 ## Bit for whether we know the true vals or not
         else:
             knowTrue = 0
     else:
         knowTrue = 0
-
+    
     npar = Model.Npar
 
     if params['out_dir'][-1] != '/':
@@ -580,6 +627,8 @@ if __name__ == '__main__':
     
     
     post = np.loadtxt(params['out_dir'] + "/post_samples.txt")
+    
+    matplotlib.rcParams.update(matplotlib.rcParamsDefault)
     
     if not args.nocorner:
         plotmaker(post, params, parameters, inj, Model, Injection)    
